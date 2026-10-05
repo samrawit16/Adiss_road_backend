@@ -23,7 +23,7 @@ from app.services.safety_service import distance_km
 
 logger = logging.getLogger(__name__)
 
-from app.core.constants import DEMO_DOMAIN  # noqa: E402,F401  (kept importable from here)
+DEMO_DOMAIN = "demo.test"
 ADDIS_UTC_OFFSET = timedelta(hours=3)  # Africa/Addis_Ababa, no DST
 
 # (road / junction, lat, lng, weight, posted limit km/h)

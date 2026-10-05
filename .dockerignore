@@ -1,0 +1,21 @@
+# Secrets and local files must never be baked into the image
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.db
+uploads/
+.pytest_cache/
+
+# Not needed to run the API (the hotspot CSV and the trained model ARE needed)
+tests/
+data/processed/
+Dockerfile
+docker-compose.yml
+*.md

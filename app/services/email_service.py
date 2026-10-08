@@ -1,5 +1,10 @@
-"""SMTP email delivery for AAGuardian verification and password-reset codes."""
+"""Email delivery for AAGuardian verification and password-reset codes.
+
+Sends through Resend (HTTPS API) or Brevo (HTTPS API) — both work on hosts
+that block SMTP ports (like Render's free tier) — falling back to plain SMTP.
+"""
 import logging
+import os
 import smtplib
 import socket
 import ssl
@@ -14,7 +19,7 @@ log = logging.getLogger("otp")
 
 
 class EmailDeliveryError(RuntimeError):
-    """SMTP failed. `.reason` explains why in plain words (for the server console, not the app)."""
+    """Delivery failed. `.reason` explains why in plain words (for the server console, not the app)."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -29,9 +34,63 @@ def brevo_configured() -> bool:
     return bool(settings.brevo_api_key)
 
 
+def resend_configured() -> bool:
+    return bool(getattr(settings, "resend_api_key", None) or os.environ.get("RESEND_API_KEY"))
+
+
 def _sender_address() -> str | None:
     return settings.email_from or settings.smtp_from_email or settings.smtp_user
 
+
+# ---------------------------------------------------------------- Resend ----
+
+def _describe_resend_error(resp: httpx.Response) -> str:
+    try:
+        detail = str(resp.json().get("message", ""))[:200]
+    except Exception:  # noqa: BLE001
+        detail = resp.text[:200]
+    if resp.status_code == 401:
+        return ("Resend rejected the API key. Create an API key in the Resend dashboard "
+                "(API Keys > Create API Key) and set RESEND_API_KEY in Render's environment.")
+    if resp.status_code == 403:
+        return (f"Resend refused the sender: {detail}. On the free plan you must send from "
+                "'onboarding@resend.dev' and only to the email address you signed up with, "
+                "until you verify your own domain in Resend (Domains).")
+    if resp.status_code == 422:
+        return (f"Resend rejected the message: {detail}. On the free plan the recipient must be "
+                "the Gmail address you signed up with.")
+    return f"Resend answered HTTP {resp.status_code}: {detail}"
+
+
+def _send_resend(to: str, subject: str, body: str) -> None:
+    """Send through Resend's HTTPS API. Works on hosts that block SMTP ports."""
+    api_key = getattr(settings, "resend_api_key", None) or os.environ.get("RESEND_API_KEY") or ""
+    payload = {
+        "from": "AAGuardian <onboarding@resend.dev>",
+        "to": [to],
+        "subject": subject,
+        "text": body,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+    last = "unknown error"
+    for attempt in (1, 2):
+        try:
+            resp = httpx.post("https://api.resend.com/emails", json=payload, headers=headers, timeout=15)
+        except httpx.HTTPError as exc:
+            last = f"Could not reach Resend ({exc.__class__.__name__}). Check the server's internet connection."
+            log.warning("Resend attempt %d/2 failed: %s", attempt, exc)
+            continue
+        if resp.status_code in (200, 201, 202):
+            return
+        last = _describe_resend_error(resp)
+        if resp.status_code in (401, 403, 422):  # retrying cannot help
+            break
+        log.warning("Resend attempt %d/2 failed: HTTP %s", attempt, resp.status_code)
+    log.error("EMAIL NOT SENT to %s: %s", to, last)
+    raise EmailDeliveryError(last)
+
+
+# ---------------------------------------------------------------- Brevo ----
 
 def _describe_brevo_error(resp: httpx.Response) -> str:
     try:
@@ -48,7 +107,7 @@ def _describe_brevo_error(resp: httpx.Response) -> str:
 
 
 def _send_brevo(to: str, subject: str, body: str) -> None:
-    """Send through Brevo's HTTPS API. Works on hosts that block SMTP ports (Render's free tier)."""
+    """Send through Brevo's HTTPS API. Works on hosts that block SMTP ports."""
     sender = _sender_address()
     if not sender:
         raise EmailDeliveryError("EMAIL_FROM is not set. Set it to the sender address you verified in Brevo.")
@@ -76,6 +135,8 @@ def _send_brevo(to: str, subject: str, body: str) -> None:
     log.error("EMAIL NOT SENT to %s: %s", to, last)
     raise EmailDeliveryError(last)
 
+
+# ----------------------------------------------------------------- SMTP ----
 
 def _password() -> str:
     # Google shows app passwords as "abcd efgh ijkl mnop"; the spaces are not part of it.
@@ -136,19 +197,24 @@ def _send_once(msg: EmailMessage) -> None:
 
 
 def send_email(to: str, subject: str, body: str) -> None:
-    """Send an email through the configured SMTP server.
+    """Send an email via Resend, Brevo, or SMTP — whichever is configured.
 
     Raises EmailDeliveryError (with a plain-language reason) on failure.
-    When SMTP is not configured at all (local dev / tests) the message, including any OTP code,
+    When nothing is configured (local dev / tests) the message, including any OTP code,
     is printed to the console instead.
     """
+    if resend_configured():
+        _send_resend(to, subject, body)
+        log.info("Email sent to %s (%s) via Resend", to, subject)
+        return
+
     if brevo_configured():
         _send_brevo(to, subject, body)
         log.info("Email sent to %s (%s) via Brevo", to, subject)
         return
 
     if not smtp_configured():
-        log.info("[DEV FALLBACK - SMTP not configured] Email to %s | subject: %s\n%s", to, subject, body)
+        log.info("[DEV FALLBACK - no email provider configured] Email to %s | subject: %s\n%s", to, subject, body)
         print(f"\n[DEV] Email to {to}: {subject}\n{body}\n", flush=True)
         return
 

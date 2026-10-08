@@ -18,15 +18,31 @@ class Settings(BaseSettings):
     smtp_user: str | None = None
     smtp_password: str | None = None
     smtp_from_email: str | None = None
+    # Port 465 uses SSL from the start; 587 (default) upgrades with STARTTLS. Leave empty to auto-detect.
     smtp_use_ssl: bool | None = None
+    # Local development only: when the email cannot be sent, print the code in the server console
+    # (and keep it valid) instead of returning an error. NEVER enable in production.
     otp_console_fallback: bool = False
+    # "development" locally. Set APP_ENV=production on the server: the API then refuses to start with
+    # unsafe default secrets (see production_problems below).
     app_env: str = "development"
+
+    # Where uploaded photos are kept: "disk" (the ./uploads folder) or "db" (inside the database).
+    # Free hosts erase the disk whenever the service sleeps or redeploys, so use "db" there.
     storage_backend: str = "disk"
+
+    # Email over HTTPS (Brevo). Free hosts such as Render block SMTP ports, so use this there.
     brevo_api_key: str | None = None
     brevo_api_url: str = "https://api.brevo.com/v3/smtp/email"
     email_from: str | None = None
     email_from_name: str = "AAGuardian"
     resend_api_key: str | None = None
+
+    # Email through a Google Apps Script web app that sends from your own Gmail (no Brevo account and no
+    # phone verification needed). See DEPLOY.md, "Option B". Both values must be set.
+    email_webhook_url: str | None = None
+    email_webhook_secret: str | None = None
+
     google_client_id: str = ""
     google_client_secret: str = ""
     microsoft_client_id: str = ""
@@ -37,10 +53,16 @@ class Settings(BaseSettings):
     max_profile_image_bytes: int = 5 * 1024 * 1024
     max_evidence_image_bytes: int = 8 * 1024 * 1024
     admin_emails: str = ""
+
+    # Default police-dashboard admin. Created (verified, active) on startup if it
+    # does not exist yet, and always treated as an admin. Override in .env.
     default_admin_email: str = "samrawityisak60@gmail.com"
     default_admin_password: str = "PoliceAdiss2026!"
     default_admin_name: str = "Police Command Admin"
     default_admin_phone: str = "+251911000000"
+
+    # Fills an empty database with realistic Addis Ababa sample reports/events so
+    # the dashboard has something to show. Off by default; never enable in production.
     seed_demo_data: bool = False
 
     class Config:
@@ -50,6 +72,7 @@ class Settings(BaseSettings):
     @field_validator("database_url", mode="before")
     @classmethod
     def _normalise_database_url(cls, value):
+        # Hosts hand out "postgres://..." or "postgresql://..."; SQLAlchemy needs the driver name.
         if isinstance(value, str):
             value = value.strip()
             if value.startswith("postgres://"):
@@ -71,6 +94,7 @@ class Settings(BaseSettings):
         return self.app_env.strip().lower() == "production"
 
     def production_problems(self) -> list[str]:
+        """Settings that must not be used on a public server."""
         problems: list[str] = []
         if self.jwt_secret_key == "dev-secret-change-me" or len(self.jwt_secret_key) < 32:
             problems.append("JWT_SECRET_KEY must be a random value of at least 32 characters.")

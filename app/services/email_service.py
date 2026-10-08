@@ -1,8 +1,4 @@
-"""Email delivery for AAGuardian verification and password-reset codes.
-
-Sends through Resend (HTTPS API) or Brevo (HTTPS API) — both work on hosts
-that block SMTP ports (like Render's free tier) — falling back to plain SMTP.
-"""
+"""SMTP email delivery for AAGuardian verification and password-reset codes."""
 import logging
 import os
 import smtplib
@@ -19,7 +15,7 @@ log = logging.getLogger("otp")
 
 
 class EmailDeliveryError(RuntimeError):
-    """Delivery failed. `.reason` explains why in plain words (for the server console, not the app)."""
+    """SMTP failed. `.reason` explains why in plain words (for the server console, not the app)."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -28,18 +24,6 @@ class EmailDeliveryError(RuntimeError):
 
 def smtp_configured() -> bool:
     return bool(settings.smtp_host and settings.smtp_user and settings.smtp_password)
-
-
-def brevo_configured() -> bool:
-    return bool(settings.brevo_api_key)
-
-
-def resend_configured() -> bool:
-    return bool(getattr(settings, "resend_api_key", None) or os.environ.get("RESEND_API_KEY"))
-
-
-def _sender_address() -> str | None:
-    return settings.email_from or settings.smtp_from_email or settings.smtp_user
 
 
 # ---------------------------------------------------------------- Resend ----
@@ -58,7 +42,7 @@ def _describe_resend_error(resp: httpx.Response) -> str:
                 "until you verify your own domain in Resend (Domains).")
     if resp.status_code == 422:
         return (f"Resend rejected the message: {detail}. On the free plan the recipient must be "
-                "the Gmail address you signed up with.")
+                "the address you signed up to Resend with.")
     return f"Resend answered HTTP {resp.status_code}: {detail}"
 
 
@@ -92,6 +76,18 @@ def _send_resend(to: str, subject: str, body: str) -> None:
 
 # ---------------------------------------------------------------- Brevo ----
 
+def brevo_configured() -> bool:
+    return bool(settings.brevo_api_key)
+
+
+def resend_configured() -> bool:
+    return bool(getattr(settings, "resend_api_key", None) or os.environ.get("RESEND_API_KEY"))
+
+
+def _sender_address() -> str | None:
+    return settings.email_from or settings.smtp_from_email or settings.smtp_user
+
+
 def _describe_brevo_error(resp: httpx.Response) -> str:
     try:
         detail = str(resp.json().get("message", ""))[:200]
@@ -107,7 +103,7 @@ def _describe_brevo_error(resp: httpx.Response) -> str:
 
 
 def _send_brevo(to: str, subject: str, body: str) -> None:
-    """Send through Brevo's HTTPS API. Works on hosts that block SMTP ports."""
+    """Send through Brevo's HTTPS API. Works on hosts that block SMTP ports (Render's free tier)."""
     sender = _sender_address()
     if not sender:
         raise EmailDeliveryError("EMAIL_FROM is not set. Set it to the sender address you verified in Brevo.")
@@ -136,7 +132,45 @@ def _send_brevo(to: str, subject: str, body: str) -> None:
     raise EmailDeliveryError(last)
 
 
-# ----------------------------------------------------------------- SMTP ----
+def webhook_configured() -> bool:
+    return bool(settings.email_webhook_url and settings.email_webhook_secret)
+
+
+def _send_webhook(to: str, subject: str, body: str) -> None:
+    """Send through a Google Apps Script web app (it sends from your own Gmail with MailApp)."""
+    payload = {
+        "secret": settings.email_webhook_secret,
+        "to": to,
+        "subject": subject,
+        "body": body,
+        "name": settings.email_from_name,
+    }
+    last = "unknown error"
+    for attempt in (1, 2):
+        try:
+            # Apps Script answers a POST with a redirect to the result, so redirects must be followed.
+            resp = httpx.post(settings.email_webhook_url, json=payload, timeout=30, follow_redirects=True)
+        except httpx.HTTPError as exc:
+            last = f"Could not reach the email relay ({exc.__class__.__name__}). Check EMAIL_WEBHOOK_URL."
+            log.warning("Email relay attempt %d/2 failed: %s", attempt, exc)
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            last = ("The email relay did not answer with JSON. In Google Apps Script, redeploy it as a Web app with "
+                    "Execute as 'Me' and Who has access 'Anyone', then copy the new /exec address.")
+            break
+        if resp.status_code == 200 and isinstance(data, dict) and data.get("ok") is True:
+            return
+        error = str(data.get("error", "") if isinstance(data, dict) else "")[:200]
+        if error == "unauthorized":
+            last = "The email relay rejected the secret. EMAIL_WEBHOOK_SECRET must equal SECRET in the Apps Script."
+        else:
+            last = f"The email relay failed: {error or 'HTTP ' + str(resp.status_code)}"
+        break
+    log.error("EMAIL NOT SENT to %s: %s", to, last)
+    raise EmailDeliveryError(last)
+
 
 def _password() -> str:
     # Google shows app passwords as "abcd efgh ijkl mnop"; the spaces are not part of it.
@@ -197,12 +231,17 @@ def _send_once(msg: EmailMessage) -> None:
 
 
 def send_email(to: str, subject: str, body: str) -> None:
-    """Send an email via Resend, Brevo, or SMTP — whichever is configured.
+    """Send an email through the configured SMTP server.
 
     Raises EmailDeliveryError (with a plain-language reason) on failure.
-    When nothing is configured (local dev / tests) the message, including any OTP code,
+    When SMTP is not configured at all (local dev / tests) the message, including any OTP code,
     is printed to the console instead.
     """
+    if webhook_configured():
+        _send_webhook(to, subject, body)
+        log.info("Email sent to %s (%s) via the Google Apps Script relay", to, subject)
+        return
+
     if resend_configured():
         _send_resend(to, subject, body)
         log.info("Email sent to %s (%s) via Resend", to, subject)
@@ -214,7 +253,7 @@ def send_email(to: str, subject: str, body: str) -> None:
         return
 
     if not smtp_configured():
-        log.info("[DEV FALLBACK - no email provider configured] Email to %s | subject: %s\n%s", to, subject, body)
+        log.info("[DEV FALLBACK - SMTP not configured] Email to %s | subject: %s\n%s", to, subject, body)
         print(f"\n[DEV] Email to {to}: {subject}\n{body}\n", flush=True)
         return
 
